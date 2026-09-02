@@ -107,6 +107,18 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	return err
 }
 
+// UpdateChatName updates only the name of an existing chat, leaving
+// last_message_time untouched. Used by the LID name resolver to fix a
+// chat's name once the contact/LID mapping becomes available, without
+// disturbing the chat's ordering.
+func (store *MessageStore) UpdateChatName(jid, name string) error {
+	_, err := store.db.Exec(
+		"UPDATE chats SET name = ? WHERE jid = ?",
+		name, jid,
+	)
+	return err
+}
+
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
@@ -906,6 +918,10 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
+	// Periodically retry naming any @lid chats still stuck on their bare
+	// LID number (see startLIDNameResolver / resolveContactDisplayName).
+	go startLIDNameResolver(client, messageStore, logger)
+
 	startRESTServer(client, messageStore, 8080)
 
 	// Create a channel to keep the main goroutine alive
@@ -922,12 +938,73 @@ func main() {
 	client.Disconnect()
 }
 
+// isBareNumericFallback reports whether name looks like one of GetChatName's
+// last-resort digit fallbacks (a bare LID or phone number written as the
+// chat name because nothing better was resolved at the time) rather than an
+// actual contact/display name. Real contact names are never purely numeric,
+// so this is a safe, general test. It deliberately does not compare against
+// a specific JID's user part: the old fallback could also write the
+// *sender's* raw digits (msg.Info.Sender.User), which for a LID-addressed
+// chat is not necessarily the same string as the chat JID's own user part
+// -- a plain equality check against jid.User would miss that case.
+func isBareNumericFallback(name string) bool {
+	if name == "" {
+		return true
+	}
+	for _, r := range name {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveContactDisplayName looks up the best available display name for a
+// JID via the whatsmeow contact store. For a LID JID it first resolves the
+// LID to the underlying phone-number JID via whatsmeow_lid_map
+// (client.Store.LIDs.GetPNForLID), then looks up whatsmeow_contacts under
+// that phone-number JID (client.Store.Contacts.GetContact) -- a LID chat's
+// contact record is keyed by phone number, not by the LID. Preference order
+// matches the 2026-09-02 manual backfill: full name, then push name, then
+// business name. Returns "" if nothing resolves.
+func resolveContactDisplayName(ctx context.Context, client *whatsmeow.Client, jid types.JID) string {
+	lookupJID := jid
+	if jid.Server == types.HiddenUserServer {
+		if pn, err := client.Store.LIDs.GetPNForLID(ctx, jid); err == nil && !pn.IsEmpty() {
+			lookupJID = pn
+		}
+	}
+
+	contact, err := client.Store.Contacts.GetContact(ctx, lookupJID)
+	if err != nil || !contact.Found {
+		return ""
+	}
+
+	switch {
+	case contact.FullName != "":
+		return contact.FullName
+	case contact.PushName != "":
+		return contact.PushName
+	case contact.BusinessName != "":
+		return contact.BusinessName
+	default:
+		return ""
+	}
+}
+
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
 	// First, check if chat already exists in database with a name
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
+	// A stored name is only trustworthy if it isn't just the bare JID user
+	// part written as a last-resort fallback (e.g. an unresolved LID number
+	// such as "20706188337381"). Re-attempt resolution in that case rather
+	// than trusting the cached fallback forever -- this is what lets a chat
+	// recover its real name on the next message it receives, once the
+	// contact/LID mapping has synced, without waiting for the periodic
+	// sweep below.
+	if err == nil && existingName != "" && !isBareNumericFallback(existingName) {
 		// Chat exists with a name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
@@ -987,15 +1064,22 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
+		// Resolve via the contact store. For a LID JID (types.HiddenUserServer,
+		// the addressing scheme WhatsApp moved to during 2026) this hops
+		// through whatsmeow_lid_map to the underlying phone-number JID first
+		// -- see resolveContactDisplayName -- because a LID chat's contact
+		// record lives under the phone-number JID, not the LID itself, so a
+		// direct lookup on the LID always misses.
+		if resolved := resolveContactDisplayName(context.Background(), client, jid); resolved != "" {
+			name = resolved
 		} else if sender != "" {
 			// Fallback to sender
 			name = sender
 		} else {
-			// Last fallback to JID
+			// Last fallback to the bare JID user part (LID or phone number).
+			// Not permanent: the resolve-on-write check above and the
+			// periodic sweep (startLIDNameResolver) both retry this once
+			// contact info syncs.
 			name = jid.User
 		}
 
@@ -1003,6 +1087,77 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	}
 
 	return name
+}
+
+// startLIDNameResolver runs a periodic sweep that retries name resolution
+// for individual @lid chats still stuck on their bare LID number -- the
+// case where a chat's only message(s) arrived before WhatsApp had synced
+// the underlying contact/LID mapping, so GetChatName's resolve-on-write
+// check (see above) never got a second chance to run because no further
+// message came in for that chat. Runs every 15 minutes; cheap, since
+// whatsmeow's LID and contact lookups are cached in memory and this only
+// touches chats that are still unresolved.
+func startLIDNameResolver(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+	// Run one pass shortly after startup too, in case contact sync
+	// completed while the bridge was offline.
+	resolveUnnamedLIDChats(client, messageStore, logger)
+
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		resolveUnnamedLIDChats(client, messageStore, logger)
+	}
+}
+
+// resolveUnnamedLIDChats does one sweep of the chats table for individual
+// @lid chats whose name is still just the bare LID number, and updates any
+// that now resolve to a real contact name.
+func resolveUnnamedLIDChats(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+	rows, err := messageStore.db.Query("SELECT jid, name FROM chats WHERE jid LIKE '%@lid'")
+	if err != nil {
+		logger.Warnf("LID name resolver: failed to query chats: %v", err)
+		return
+	}
+
+	type pendingChat struct{ jid, name string }
+	var candidates []pendingChat
+	for rows.Next() {
+		var jidStr, name string
+		if err := rows.Scan(&jidStr, &name); err != nil {
+			continue
+		}
+		candidates = append(candidates, pendingChat{jidStr, name})
+	}
+	rows.Close()
+
+	resolvedCount := 0
+	for _, c := range candidates {
+		jid, err := types.ParseJID(c.jid)
+		if err != nil {
+			continue
+		}
+		// Still unresolved if the stored name is empty or just digits -- the
+		// fallback GetChatName writes when nothing else is available (see
+		// isBareNumericFallback).
+		if !isBareNumericFallback(c.name) {
+			continue
+		}
+
+		resolved := resolveContactDisplayName(context.Background(), client, jid)
+		if resolved == "" || resolved == c.name {
+			continue
+		}
+
+		if err := messageStore.UpdateChatName(c.jid, resolved); err != nil {
+			logger.Warnf("LID name resolver: failed to update chat %s: %v", c.jid, err)
+			continue
+		}
+		resolvedCount++
+	}
+
+	if resolvedCount > 0 {
+		logger.Infof("LID name resolver: resolved %d chat name(s) from LID number to contact name", resolvedCount)
+	}
 }
 
 // Handle history sync events
