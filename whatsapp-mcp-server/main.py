@@ -1,3 +1,4 @@
+import os
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
@@ -17,6 +18,23 @@ from whatsapp import (
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
+
+# --- Outbound gate -------------------------------------------------------
+# The send tools are NOT registered unless WHATSAPP_ENABLE_SEND is set to a
+# truthy value. Default is read-only: an unregistered tool is absent from the
+# tool list entirely, so a prompt-injected instruction has no WhatsApp
+# exfiltration channel to reach for. Read tools are unaffected.
+# Enable by adding to the whatsapp entry in claude_desktop_config.json:
+#     "env": {"WHATSAPP_ENABLE_SEND": "1"}
+SEND_ENABLED = os.environ.get("WHATSAPP_ENABLE_SEND", "").strip().lower() in (
+    "1", "true", "yes", "on")
+
+
+def _send_tool(fn):
+    """Register fn as an MCP tool only when sending is explicitly enabled."""
+    return mcp.tool()(fn) if SEND_ENABLED else fn
+
+
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
@@ -154,7 +172,7 @@ def get_message_context(
     context = whatsapp_get_message_context(message_id, before, after)
     return context
 
-@mcp.tool()
+@_send_tool
 def send_message(
     recipient: str,
     message: str
@@ -183,7 +201,7 @@ def send_message(
         "message": status_message
     }
 
-@mcp.tool()
+@_send_tool
 def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
     
@@ -203,7 +221,7 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
         "message": status_message
     }
 
-@mcp.tool()
+@_send_tool
 def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
     

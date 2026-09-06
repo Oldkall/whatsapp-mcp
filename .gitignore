@@ -2,3 +2,6 @@
 claude_desktop_config.json
 whatsapp.log
 whatsapp-bridge/whatsapp-bridge
+
+# Message database, media downloads and DB backups — never commit
+whatsapp-bridge/store/
