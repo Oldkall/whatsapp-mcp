@@ -1,0 +1,17 @@
+[Unit]
+Description=WhatsApp bridge (whatsmeow) — live human-conversation channel
+Documentation=https://github.com/Oldkall/whatsapp-mcp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/whatsapp-mcp/whatsapp-bridge
+ExecStart=/opt/whatsapp-mcp/whatsapp-bridge/whatsapp-bridge
+Restart=always
+RestartSec=20
+StandardOutput=append:/opt/whatsapp-mcp/whatsapp-bridge/bridge.log
+StandardError=append:/opt/whatsapp-mcp/whatsapp-bridge/bridge.log
+
+[Install]
+WantedBy=default.target
