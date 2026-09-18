@@ -680,10 +680,12 @@ func extractDirectPathFromURL(url string) string {
 
 	pathPart := parts[1]
 
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
+	// Keep the query string. whatsmeow's DownloadMediaWithPath builds the final
+	// CDN URL as "https://<host>" + directPath + "&hash=...&mms-type=...", i.e. it
+	// assumes the direct path still carries its own "?ccb=...&oh=...&oe=..."
+	// signature. Stripping the query here produced a URL whose parameters were
+	// glued on with "&" but no "?", so the signature was lost and WhatsApp
+	// answered 403 for every media download.
 	return "/" + pathPart
 }
 
