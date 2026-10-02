@@ -5,3 +5,5 @@ whatsapp-bridge/whatsapp-bridge
 
 # Message database, media downloads and DB backups — never commit
 whatsapp-bridge/store/
+whatsapp-bridge/bridge.log
+whatsapp-bridge/whatsapp-bridge.pre-*
