@@ -7,3 +7,12 @@ whatsapp-bridge/whatsapp-bridge
 whatsapp-bridge/store/
 whatsapp-bridge/bridge.log
 whatsapp-bridge/whatsapp-bridge.pre-*
+# estate hygiene (standard block)
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+*.bak
+*.bak-*
+*.bak.*
+*.orig
