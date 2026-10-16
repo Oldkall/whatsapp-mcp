@@ -795,7 +795,14 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	// Bind to loopback by default (2026-10-16): the only client is the MCP server on this
+	// host (WHATSAPP_API_BASE_URL=http://localhost:8080). Set WA_BRIDGE_BIND=0.0.0.0 or a
+	// tailnet address to expose it deliberately.
+	bind := os.Getenv("WA_BRIDGE_BIND")
+	if bind == "" {
+		bind = "127.0.0.1"
+	}
+	serverAddr := fmt.Sprintf("%s:%d", bind, port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
